@@ -1,0 +1,31 @@
+MMM-Project/
+├── README.md
+├── LICENSE
+├── requirements.txt
+├── .gitignore
+├── environment.yml           # optional (conda)
+├── data/
+│   ├── README.md             # instructions to get data (DO NOT commit sensitive raw .xlsx)
+│   ├── Case_Study_Input_File.xlsx  # (OPTIONAL: include only if non-sensitive)
+│   └── mmm_results.xlsx      # (results; optional)
+├── notebooks/
+│   ├── 01_EDA.ipynb
+│   ├── 02_transformations_adstock_hill.ipynb
+│   └── 03_modeling_contributions.ipynb
+├── src/
+│   ├── data_preparation.py
+│   ├── transformations.py    # adstock & hill functions
+│   ├── modeling.py           # model pipeline (fit, diagnostics, contributions)
+│   ├── diagnostics.py
+│   ├── plotting.py
+│   └── utils.py
+├── results/
+│   ├── figures/
+│   └── tables/
+├── docs/
+│   └── MMM_Project_Analysis.pdf   # final report (if OK to include)
+├── presentation/
+│   └── MMM_Project_Analysis_CleanCover_v2.pptx  # your slides. :contentReference[oaicite:1]{index=1}
+└── .github/
+    └── workflows/
+        └── ci.yml
