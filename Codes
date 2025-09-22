@@ -1,0 +1,346 @@
+
+import re, math, numpy as np, pandas as pd, matplotlib.pyplot as plt
+from pathlib import Path
+import statsmodels.api as sm
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+from statsmodels.stats.diagnostic import het_breuschpagan
+from statsmodels.tsa.stattools import adfuller
+from scipy import stats
+
+# ---------------- CONFIG ----------------
+DATA_PATH = "/content/Case_Study_Input_File.xlsx"
+OUT = Path("mmm_outputs_excel")
+OUT.mkdir(exist_ok=True)
+RESULTS_FILE = OUT/"mmm_results.xlsx"
+
+# adstock / hill grids
+DECAY_GRID = [0.0, 0.1, 0.3, 0.5]
+ALPHA_GRID = [0.5, 1, 2, 5, 10]    # Hill alpha (half-saturation)
+THETA_GRID = [0.5, 1.0, 2.0]       # Hill slope
+
+# helper functions
+def safe_to_numeric(s):
+    return pd.to_numeric(s, errors="coerce")
+
+def adstock(series, decay):
+    x = safe_to_numeric(series).fillna(0).astype(float).values
+    res = np.zeros_like(x)
+    for i in range(len(x)):
+        res[i] = x[i] + (decay * res[i-1] if i>0 else 0.0)
+    return pd.Series(res, index=series.index)
+
+def hill(x, alpha, theta):
+    # x must be numeric array/series
+    x = np.array(x, dtype=float)
+    # avoid zero division
+    return (x**theta) / (alpha**theta + x**theta + 1e-12)
+
+def compute_vif(df_X):
+    # df_X: pandas DataFrame, numeric
+    X = df_X.copy().apply(pd.to_numeric, errors="coerce").fillna(0).astype(float)
+    vif_data = []
+    for i in range(X.shape[1]):
+        try:
+            v = variance_inflation_factor(X.values, i)
+        except Exception:
+            v = np.nan
+        vif_data.append({"feature": X.columns[i], "VIF": v})
+    return pd.DataFrame(vif_data)
+
+# ---------------- 1. Load data ----------------
+df = pd.read_excel(DATA_PATH)
+print("Data loaded. Shape:", df.shape)
+# detect date and KPI
+date_col = None
+for c in df.columns:
+    if re.search(r"date|month|week|day", c, flags=re.I):
+        date_col = c; break
+if date_col:
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df = df.sort_values(date_col).reset_index(drop=True)
+    df["_period"] = np.arange(len(df))
+else:
+    df["_period"] = np.arange(len(df))
+
+y_candidates = [c for c in df.columns if re.search(r"sales|revenue|gmv|kpi|units|orders|conversions", c, flags=re.I)]
+if len(y_candidates)>0:
+    y_col = y_candidates[0]
+else:
+    nums = df.select_dtypes(include=[np.number]).columns.tolist()
+    if not nums:
+        raise ValueError("No numeric columns found")
+    y_col = max(nums, key=lambda c: df[c].var())
+
+print("Dependent variable (KPI):", y_col)
+
+# auto-identify media vs controls from numeric columns (only uses columns present in file)
+numeric_cols = [c for c in df.select_dtypes(include=[np.number]).columns if c not in {y_col, "_period"}]
+media_keywords = ["spend","cost","tv","radio","digital","facebook","google","youtube","promo","ads","impressions","clicks"]
+media_cols = [c for c in numeric_cols if any(k in c.lower() for k in media_keywords)]
+if not media_cols:
+    media_cols = numeric_cols.copy()
+control_cols = [c for c in numeric_cols if c not in media_cols]
+
+print("Media cols:", media_cols)
+print("Control cols:", control_cols)
+
+# ---------------- 2. EDA & checks ----------------
+desc = df.describe()
+missing = df.isna().sum().to_frame("missing_count")
+corr = df[[y_col] + media_cols + control_cols].corr()
+
+# stationarity
+adf_res = None
+try:
+    adf_stat, adf_p, *_ = adfuller(safe_to_numeric(df[y_col]).dropna())
+    adf_res = {"adf_stat": float(adf_stat), "pvalue": float(adf_p)}
+except Exception:
+    adf_res = {}
+
+# initial VIF (on raw numeric candidates)
+vif_initial = pd.DataFrame()
+if len(media_cols+control_cols) > 0:
+    try:
+        vif_initial = compute_vif(df[media_cols+control_cols])
+    except Exception:
+        vif_initial = pd.DataFrame()
+
+# ---------------- 3. Per-channel adstock + hill parameter search (sequential greedy) ----------------
+# We select for each media channel (in order) the decay, alpha, theta that when the transformed
+# series is included in the model (with already selected transforms for previous channels) gives best adj-R2.
+df_model = df.copy()
+selected_specs = {}   # channel -> dict(decay,alpha,theta, series)
+baseline_predictors = control_cols.copy()
+
+# adapt cross-check: small dataset -> be conservative
+for ch in media_cols:
+    best_adj = -1e9
+    best_spec = None
+    # ensure we use numeric version of channel
+    for decay in DECAY_GRID:
+        # compute adstock once
+        ad = adstock(df[ch], decay)
+        for alpha in ALPHA_GRID:
+            for theta in THETA_GRID:
+                trans = hill(ad, alpha, theta)
+                df_model[f"{ch}_trans_try"] = trans
+                # create X with baseline + previously selected channel transforms + this candidate
+                X_cols = baseline_predictors + [f"{p}_trans" for p in selected_specs.keys()] + [f"{ch}_trans_try"]
+                X_try = df_model[X_cols].apply(pd.to_numeric, errors="coerce").fillna(0).astype(float)
+                Xc = sm.add_constant(X_try)
+                y = safe_to_numeric(df_model[y_col]).fillna(0).astype(float)
+                try:
+                    adj = sm.OLS(y, Xc).fit().rsquared_adj
+                except Exception:
+                    adj = -1e9
+                if adj > best_adj:
+                    best_adj = adj
+                    best_spec = {"decay": decay, "alpha": alpha, "theta": theta, "series": trans.copy()}
+                # cleanup temporary
+                del df_model[f"{ch}_trans_try"]
+    # if nothing found, fallback to linear adstock(0)
+    if best_spec is None:
+        best_spec = {"decay": 0.0, "alpha": 1.0, "theta": 1.0, "series": adstock(df[ch], 0.0)}
+    selected_specs[ch] = best_spec
+    # store final transformed series as "<ch>_trans"
+    df_model[f"{ch}_trans"] = selected_specs[ch]["series"]
+    baseline_predictors.append(f"{ch}_trans")
+    print(f"Selected for {ch}: decay={best_spec['decay']}, alpha={best_spec['alpha']}, theta={best_spec['theta']} (adj-R2 contribution ~ {best_adj:.4f})")
+
+# ---------------- 4. Build final design matrix, add month dummies if date exists ----------------
+month_cols = []
+if date_col:
+    df_model["_month"] = df_model[date_col].dt.month
+    month_dummies = pd.get_dummies(df_model["_month"].astype(int), prefix="m", drop_first=True)
+    df_model = pd.concat([df_model, month_dummies], axis=1)
+    month_cols = month_dummies.columns.tolist()
+
+predictor_columns = control_cols + [f"{ch}_trans" for ch in media_cols] + month_cols
+X_full = df_model[predictor_columns].apply(pd.to_numeric, errors="coerce").fillna(0).astype(float)
+y_full = safe_to_numeric(df_model[y_col]).fillna(0).astype(float)
+
+# ---------------- 5. Iterative VIF-based feature dropping ----------------
+def iterative_vif_filter(X, thresh=10.0):
+    Xf = X.copy()
+    while True:
+        if Xf.shape[1] <= 1:
+            break
+        try:
+            vif_now = compute_vif(Xf)
+        except Exception:
+            break
+        high = vif_now[vif_now["VIF"] > thresh]
+        if high.empty:
+            break
+        # drop the feature with highest VIF
+        drop = high.sort_values("VIF", ascending=False).iloc[0]["feature"]
+        Xf = Xf.drop(columns=[drop])
+        print(f"VIF filter: dropped {drop} (VIF > {thresh})")
+    return Xf
+
+X_filtered = iterative_vif_filter(X_full, thresh=10.0)
+Xc_final = sm.add_constant(X_filtered)
+model = sm.OLS(y_full, Xc_final).fit(cov_type="HC3")
+
+# ---------------- 6. Print model fit metrics (Colab output) ----------------
+print("\n===== Model fit (printed) =====")
+print(f"R-squared: {model.rsquared:.4f}")
+print(f"Adj. R-squared: {model.rsquared_adj:.4f}")
+print(f"Num obs: {int(model.nobs)}")
+print(model.summary().tables[0])   # short header info
+print("================================\n")
+
+# ---------------- 7. Coefficients, residual tests, contributions & ROI ----------------
+coef_df = model.params.reset_index()
+coef_df.columns = ["feature","coefficient"]
+coef_df["pvalue"] = model.pvalues.values
+coef_df["std_err"] = model.bse.values
+
+# residual diagnostics
+bp = het_breuschpagan(model.resid, Xc_final)
+sh = stats.shapiro(model.resid) if len(model.resid)<5000 else (None,None)
+resid_tests = {"BP_lm_p": bp[1], "BP_f_p": bp[3], "Shapiro_stat": (sh[0] if sh else None), "Shapiro_p": (sh[1] if sh else None)}
+
+# contributions: coefficient * transformed series sum
+contribs = {}
+rois = {}
+for ch in media_cols:
+    trans_name = f"{ch}_trans"
+    if trans_name in coef_df["feature"].values:
+        coef_val = float(coef_df.loc[coef_df.feature==trans_name, "coefficient"].values[0])
+        contrib_val = (coef_val * df_model[trans_name].fillna(0)).sum()
+    else:
+        contrib_val = 0.0
+    spend_total = safe_to_numeric(df[ch]).sum() if ch in df.columns else 0.0
+    roi = (contrib_val / spend_total) if (spend_total and not math.isclose(spend_total, 0.0)) else np.nan
+    contribs[ch] = contrib_val
+    rois[ch] = roi
+
+contrib_df = pd.DataFrame({
+    "channel": list(contribs.keys()),
+    "decay": [selected_specs[ch]["decay"] for ch in contribs.keys()],
+    "alpha": [selected_specs[ch]["alpha"] for ch in contribs.keys()],
+    "theta": [selected_specs[ch]["theta"] for ch in contribs.keys()],
+    "contribution": [contribs[ch] for ch in contribs.keys()],
+    "spend": [safe_to_numeric(df[ch]).sum() for ch in contribs.keys()],
+    "ROI": [rois[ch] for ch in contribs.keys()]
+}).sort_values("ROI", ascending=False)
+
+# ---------------- 8. Response curves (adstock + hill), compute marginal ROI around current spend ----------------
+def predict_mean_for_spend_channel(channel, spend_value, df_model_local, selected_specs_local, X_filtered_cols):
+    # create a copy, change only that channel's raw spend to spend_value, recompute its transformed value
+    df_t = df.copy()   # original raw data
+    if channel not in df_t.columns:
+        return np.nan
+    df_t[channel] = spend_value  # set all rows to the test spend (we use average predicted)
+    # recompute transforms for each media channel using existing chosen specs
+    for ch in media_cols:
+        spec = selected_specs_local[ch]
+        ad = adstock(df_t[ch], spec["decay"])
+        trans = hill(ad, spec["alpha"], spec["theta"])
+        df_t[f"{ch}_trans"] = trans
+    # month dummies if exist
+    if date_col:
+        df_t["_month"] = pd.to_datetime(df_t[date_col], errors="coerce").dt.month
+        month_dummies = pd.get_dummies(df_t["_month"].astype(int), prefix="m", drop_first=True)
+        df_t = pd.concat([df_t, month_dummies], axis=1)
+    # build X using X_filtered columns
+    X_t = df_t[X_filtered_cols].apply(pd.to_numeric, errors="coerce").fillna(0).astype(float)
+    X_t = sm.add_constant(X_t, has_constant='add')
+    # align columns
+    X_t = X_t.reindex(columns=Xc_final.columns, fill_value=0)
+    preds = model.predict(X_t)
+    return float(preds.mean())
+
+# for each channel, compute current predicted mean and predicted mean at +10% spend
+marginal_results = []
+for ch in contrib_df.channel:
+    curr_spend = float(safe_to_numeric(df[ch]).mean())  # use mean observed spend as baseline per-period
+    total_spend = float(safe_to_numeric(df[ch]).sum())  # total across dataset for ROI calc earlier
+    if math.isclose(total_spend, 0.0):
+        marginal_results.append({"channel": ch, "curr_spend_mean": curr_spend, "marginal_ROI_per_10%": np.nan})
+        continue
+    pred_curr = predict_mean_for_spend_channel(ch, curr_spend, df_model, selected_specs, X_filtered.columns)
+    pred_up = predict_mean_for_spend_channel(ch, curr_spend * 1.10, df_model, selected_specs, X_filtered.columns)
+    # uplift per period (mean KPI units)
+    uplift = pred_up - pred_curr
+    # incremental spend per period (10% of mean spend)
+    inc_spend = 0.10 * curr_spend
+    marginal_roi_per_unit = (uplift / inc_spend) if inc_spend != 0 else np.nan
+    marginal_results.append({
+        "channel": ch,
+        "curr_spend_mean": curr_spend,
+        "pred_curr_mean_kpi": pred_curr,
+        "pred_up10_mean_kpi": pred_up,
+        "uplift_mean_kpi": uplift,
+        "inc_spend_mean": inc_spend,
+        "marginal_ROI_per_unit": marginal_roi_per_unit
+    })
+
+marginal_df = pd.DataFrame(marginal_results).sort_values("marginal_ROI_per_unit", ascending=False)
+
+# produce response plots for top 3 channels by marginal ROI (concave)
+top_chs = marginal_df.dropna(subset=["marginal_ROI_per_unit"]).channel.tolist()[:3]
+for ch in top_chs:
+    raw_max = safe_to_numeric(df[ch]).max()
+    if math.isnan(raw_max) or raw_max == 0:
+        raw_max = 1.0
+    test_spends = np.linspace(0, 1.5 * raw_max, 40)
+    preds = []
+    for s in test_spends:
+        preds.append(predict_mean_for_spend_channel(ch, s, df_model, selected_specs, X_filtered.columns))
+    plt.figure(figsize=(6,4))
+    plt.plot(test_spends, preds, lw=2)
+    plt.title(f"Response curve: {ch}")
+    plt.xlabel("Spend")
+    plt.ylabel(y_col)
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(OUT/f"response_{ch}.png")
+    plt.close()
+
+# ---------------- 9. Simple budget recommendation ----------------
+# Move 10% of total spend from lowest marginal ROI channel to highest marginal ROI channel (model-based estimate)
+sorted_m = marginal_df.sort_values("marginal_ROI_per_unit", ascending=False).reset_index(drop=True)
+reco_text = "No recommendation (insufficient data)"
+if len(sorted_m) >= 2 and not sorted_m["marginal_ROI_per_unit"].isnull().all():
+    top = sorted_m.iloc[0]
+    bottom = sorted_m.iloc[-1]
+    # total transfer: 10% of bottom channel total spend (observed)
+    transfer_amount = 0.10 * (safe_to_numeric(df[bottom["channel"]]).sum())
+    # estimate uplift in KPI (approx): transfer_amount / mean_period_spend * uplift_mean_kpi
+    # better: scale marginal ROI per unit by transfer amount in the same units as used
+    # We computed marginal_ROI_per_unit as uplift per unit spend (per period mean basis), but to keep simple:
+    # Estimate uplift (total) = marginal_ROI_per_unit_top * transfer_amount / (periods)  (approx)
+    n_periods = max(1, int(len(df)))
+    # compute per-unit ROI in KPI per currency-unit: marginal_ROI_per_unit uses mean-period spend; approximate per-currency-unit
+    top_mru = top["marginal_ROI_per_unit"]
+    expected_total_kpi_uplift = top_mru * transfer_amount / max(1.0, (0.10 * safe_to_numeric(df[top["channel"]]).mean())) if (0.10 * safe_to_numeric(df[top["channel"]]).mean())!=0 else top_mru * transfer_amount
+    # Simpler conservative estimate: use uplift per mean-period inc_spend scaled to total transfer proportionally:
+    # We'll present a conservative message
+    reco_text = (f"Recommend reallocating {transfer_amount:.2f} units (10% of total spend) from '{bottom['channel']}' "
+                 f"to '{top['channel']}'. Expected (model-based, approximate) KPI uplift (total over dataset): ~{expected_total_kpi_uplift:.2f}.")
+else:
+    reco_text = "Could not compute a safe reallocation recommendation (insufficient marginal ROI data)."
+
+print("=== Recommendation ===")
+print(reco_text)
+print("======================")
+
+# ---------------- 10. Save everything to one Excel workbook ----------------
+with pd.ExcelWriter(RESULTS_FILE, engine="openpyxl") as writer:
+    desc.to_excel(writer, sheet_name="Descriptive_Stats")
+    missing.to_excel(writer, sheet_name="Missing_Values")
+    corr.to_excel(writer, sheet_name="Correlation_Matrix")
+    if not vif_initial.empty: vif_initial.to_excel(writer, sheet_name="Initial_VIF", index=False)
+    coef_df.to_excel(writer, sheet_name="Model_Coefficients", index=False)
+    pd.DataFrame([resid_tests]).to_excel(writer, sheet_name="Residual_Tests", index=False)
+    contrib_df.to_excel(writer, sheet_name="Contributions_ROI", index=False)
+    marginal_df.to_excel(writer, sheet_name="Marginal_ROI", index=False)
+    # brief model summary sheet with R2 only
+    pd.DataFrame([{"R2": model.rsquared, "Adj_R2": model.rsquared_adj}]).to_excel(writer, sheet_name="Model_Summary", index=False)
+    # recommendation
+    pd.DataFrame([{"recommendation": reco_text}]).to_excel(writer, sheet_name="Recommendation", index=False)
+
+print("\nSaved Excel at:", RESULTS_FILE.resolve())
+print("Response curve PNGs saved in:", OUT.resolve())
